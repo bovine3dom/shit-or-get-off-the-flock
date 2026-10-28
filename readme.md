@@ -1,6 +1,6 @@
 # shit or get off the flock (sogotf)
 
-dead simple queue for exclusive device use. short jobs jump the queue
+dead simple queue for shared and exclusive device use. short jobs jump the queue
 
 ## build
 
@@ -23,6 +23,8 @@ the scheduler runs in the foreground. probably best to run it as a service. othe
 ```sh
 flock /tmp/gpu.lock your-existing-command
 ```
+
+jobs share the device by default, with up to 10 running together. set another limit with `--max-shared`; external shared lock holders use additional slots. existing exclusive lock users wait for shared jobs to finish.
 
 for multiple devices, give each scheduler its own lock and state directory. set the directory with `--state-dir DIR` before the command, or with `SOGOTF_DIR`; the default is `~/.local/state/sogotf`. the directory must belong to the scheduler user and have mode `0700`.
 
@@ -65,8 +67,8 @@ systemd stops the service's running jobs when you stop or restart the service; t
 # queue and get a job id and estimated wait. all times in seconds
 sogotf --approx-execution-time 120 -- python train.py
 
-# queue and wait for the result
-sogotf --wait --approx-execution-time 10 -- ./render --frames 20
+# queue an exclusive job and wait for the result
+sogotf --exclusive --wait --approx-execution-time 10 -- ./render --frames 20
 
 sogotf list
 sogotf status 1
@@ -81,9 +83,11 @@ jobs get the submitter's working directory and environment, with stdout and stde
 
 each job gets a target of submission time + 2 × estimated runtime, and the earliest target runs first. short jobs can jump ahead, while older jobs eventually take priority over new arrivals.
 
+when an exclusive job reaches the front while shared jobs are running, the scheduler lets those jobs finish before starting it. new shared jobs wait until the exclusive job has run.
+
 the target is a goal, and running jobs, external lock holders or bad estimates can make you wait longer.
 
-the estimated wait is the running job's estimated remaining time plus the estimates of jobs ahead; new jobs can change it, and an external lock holder makes it unknown.
+the estimated wait accounts for running jobs, shared slots and jobs ahead; new jobs can change it, and an external lock holder can make it unknown.
 
 give each job a runtime estimate in seconds, or let the scheduler use the mean of the last 10 completed jobs. when the history is empty, it uses the configured default; the estimate stays fixed after submission.
 
@@ -91,7 +95,7 @@ give each job a runtime estimate in seconds, or let the scheduler use the mean o
 
 jobs get kicked off after `--max-runtime` or 3 × their estimated runtime, whichever comes first; the clock starts at launch. estimates above the maximum are rejected.
 
-idle eviction is off by default; to kick jobs off GPU 0 after utilization stays below 10% for 120 seconds:
+idle eviction applies to exclusive jobs and is off by default. to kick exclusive jobs off GPU 0 after utilization stays below 10% for 120 seconds:
 
 ```sh
 sogotf serve --lock /tmp/gpu.lock \
@@ -106,6 +110,7 @@ device utilization includes other processes, and jobs can go quiet while loading
 | option | default | what it does |
 | --- | --- | --- |
 | `--lock PATH` | required | shared `flock` file |
+| `--max-shared JOBS` | 10 | maximum concurrent shared jobs |
 | `--max-runtime SECONDS` | 86400 | maximum job runtime |
 | `--default-estimate SECONDS` | 3600 | estimate before history exists |
 | `--startup SECONDS` | 60 | grace period before idle sampling |
@@ -119,7 +124,7 @@ on cancellation or eviction, the scheduler sends `SIGTERM` to the job's process 
 
 jobs inherit the lock descriptor, so a job can keep running and hold the lock if the scheduler dies. the lock stays held until its processes close the descriptor or exit.
 
-on restart, the scheduler marks starting or running jobs as interrupted and continues the saved queue; interrupted jobs need manual supervision. processes that close the descriptor or escape the group need their own cleanup.
+on restart, the scheduler marks starting or running jobs as interrupted and waits for the device lock to become free before continuing the queue. interrupted jobs need manual supervision, and processes that close the descriptor or escape the group need their own cleanup. jobs queued with an older version keep exclusive access.
 
 ## tests
 

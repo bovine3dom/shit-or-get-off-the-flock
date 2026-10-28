@@ -1,4 +1,5 @@
 use crate::model::{estimate_wait, now, ordered, Job, Request, Response, State, Status};
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -13,6 +14,7 @@ use std::time::{Duration, Instant};
 pub struct Config {
     pub dir: PathBuf,
     pub lock: PathBuf,
+    pub max_shared: usize,
     pub max_runtime: u64,
     pub default_estimate: u64,
     pub startup: u64,
@@ -22,9 +24,9 @@ pub struct Config {
 }
 
 struct Running {
-    id: u64,
     child: Child,
     _lock: File,
+    exclusive: bool,
     started: Instant,
     low_since: Option<Instant>,
     stopping: Option<(Instant, Status, String)>,
@@ -39,7 +41,8 @@ struct Sample {
 struct Server {
     config: Config,
     state: State,
-    running: Option<Running>,
+    running: BTreeMap<u64, Running>,
+    draining: Option<u64>,
     sample: Option<Sample>,
     next_sample: Instant,
 }
@@ -63,8 +66,13 @@ fn open_lock(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
-fn try_lock(file: &File) -> io::Result<bool> {
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+fn try_lock(file: &File, exclusive: bool) -> io::Result<bool> {
+    let mode = if exclusive {
+        libc::LOCK_EX
+    } else {
+        libc::LOCK_SH
+    };
+    if unsafe { libc::flock(file.as_raw_fd(), mode | libc::LOCK_NB) } == 0 {
         return Ok(true);
     }
     let error = io::Error::last_os_error();
@@ -96,12 +104,15 @@ impl Server {
         File::open(&self.config.dir)?.sync_all()
     }
 
-    fn external_lock(&self) -> io::Result<bool> {
-        if self.running.is_some() {
+    fn external_lock(&self, exclusive: bool) -> io::Result<bool> {
+        if self.state.recovery_pending {
+            return Ok(true);
+        }
+        if !self.running.is_empty() {
             return Ok(false);
         }
         let file = open_lock(&self.config.lock)?;
-        Ok(!try_lock(&file)?)
+        Ok(!try_lock(&file, exclusive)?)
     }
 
     fn request(&mut self, request: Request) -> io::Result<Response> {
@@ -111,6 +122,7 @@ impl Server {
                 cwd,
                 env,
                 estimate,
+                exclusive,
             } => {
                 if command.is_empty() || command[0].is_empty() {
                     return Ok(Response::error("command is empty"));
@@ -129,7 +141,6 @@ impl Server {
                         "estimate must be between 1 and the maximum runtime",
                     ));
                 }
-                let external = self.external_lock()?;
                 let id = self.state.next_id.max(1);
                 self.state.next_id = id
                     .checked_add(1)
@@ -141,26 +152,43 @@ impl Server {
                     env,
                     submitted: now(),
                     estimate,
+                    exclusive,
                     started: None,
                     finished: None,
                     status: Status::Queued,
                     exit_code: None,
                     detail: None,
                 });
-                self.save()?;
-                let remaining = self
+                let active: Vec<_> = self
                     .running
-                    .as_ref()
-                    .map(|r| {
-                        let job = self.state.jobs.iter().find(|j| j.id == r.id).unwrap();
-                        job.estimate.saturating_sub(r.started.elapsed().as_secs())
+                    .iter()
+                    .map(|(id, r)| {
+                        let job = self.state.jobs.iter().find(|j| j.id == *id).unwrap();
+                        (
+                            job.estimate.saturating_sub(r.started.elapsed().as_secs()),
+                            r.exclusive,
+                        )
                     })
-                    .unwrap_or(0);
+                    .collect();
+                let needs_exclusive = self.draining.is_some()
+                    || ordered(&self.state)
+                        .iter()
+                        .take_while(|j| j.id != id)
+                        .any(|j| j.exclusive)
+                    || exclusive;
+                let external = self.external_lock(needs_exclusive)?;
+                self.save()?;
                 let mut response = Response::jobs(vec![self.state.jobs.last().unwrap().clone()]);
                 response.wait_seconds = if external {
                     None
                 } else {
-                    estimate_wait(&self.state, id, remaining)
+                    estimate_wait(
+                        &self.state,
+                        id,
+                        &active,
+                        self.config.max_shared,
+                        self.draining,
+                    )
                 };
                 Ok(response)
             }
@@ -176,8 +204,8 @@ impl Server {
                 if job.status == Status::Queued {
                     job.status = Status::Cancelled;
                     job.finished = Some(now());
-                } else if self.running.as_ref().is_some_and(|r| r.id == id) {
-                    self.stop(Status::Cancelled, "cancelled by user");
+                } else if self.running.contains_key(&id) {
+                    self.stop(id, Status::Cancelled, "cancelled by user");
                 } else {
                     return Ok(Response::error("job is already finished"));
                 }
@@ -193,17 +221,12 @@ impl Server {
         }
     }
 
-    fn stop(&mut self, status: Status, reason: &str) {
-        if let Some(running) = &mut self.running {
+    fn stop(&mut self, id: u64, status: Status, reason: &str) {
+        if let Some(running) = self.running.get_mut(&id) {
             if running.stopping.is_none() {
                 signal_group(running.child.id(), libc::SIGTERM);
                 running.stopping = Some((Instant::now(), status, reason.to_owned()));
-                let job = self
-                    .state
-                    .jobs
-                    .iter_mut()
-                    .find(|j| j.id == running.id)
-                    .unwrap();
+                let job = self.state.jobs.iter_mut().find(|j| j.id == id).unwrap();
                 job.status = Status::Stopping;
                 job.detail = Some(reason.to_owned());
             }
@@ -211,15 +234,52 @@ impl Server {
     }
 
     fn start_next(&mut self) -> io::Result<()> {
-        if self.running.is_some() {
-            return Ok(());
+        if self.state.recovery_pending {
+            if !self.running.is_empty() {
+                return Ok(());
+            }
+            let lock = open_lock(&self.config.lock)?;
+            if !try_lock(&lock, true)? {
+                return Ok(());
+            }
+            self.state.recovery_pending = false;
+            self.save()?;
         }
-        let Some(id) = ordered(&self.state).first().map(|j| j.id) else {
+        if self.draining.is_some_and(|id| {
+            !self
+                .state
+                .jobs
+                .iter()
+                .any(|j| j.id == id && j.status == Status::Queued)
+        }) {
+            self.draining = None;
+        }
+        let next = self
+            .draining
+            .and_then(|id| self.state.jobs.iter().find(|j| j.id == id))
+            .or_else(|| ordered(&self.state).first().copied());
+        let Some(job) = next else {
             return Ok(());
         };
-        let lock = open_lock(&self.config.lock)?;
-        if !try_lock(&lock)? {
+        let (id, exclusive) = (job.id, job.exclusive);
+        if exclusive && !self.running.is_empty() {
+            if self.running.values().all(|r| !r.exclusive) {
+                self.draining = Some(id);
+            }
             return Ok(());
+        }
+        if !exclusive
+            && (self.running.len() >= self.config.max_shared
+                || self.running.values().any(|r| r.exclusive))
+        {
+            return Ok(());
+        }
+        let lock = open_lock(&self.config.lock)?;
+        if !try_lock(&lock, exclusive)? {
+            return Ok(());
+        }
+        if self.draining == Some(id) {
+            self.draining = None;
         }
         let job = self.state.jobs.iter_mut().find(|j| j.id == id).unwrap();
         job.status = Status::Starting;
@@ -253,16 +313,21 @@ impl Server {
                     .find(|j| j.id == id)
                     .unwrap()
                     .status = Status::Running;
-                self.running = Some(Running {
+                self.running.insert(
                     id,
-                    child,
-                    _lock: lock,
-                    started: Instant::now(),
-                    low_since: None,
-                    stopping: None,
-                    exit: None,
-                });
-                self.next_sample = Instant::now() + Duration::from_secs(self.config.startup);
+                    Running {
+                        child,
+                        _lock: lock,
+                        exclusive,
+                        started: Instant::now(),
+                        low_since: None,
+                        stopping: None,
+                        exit: None,
+                    },
+                );
+                if exclusive {
+                    self.next_sample = Instant::now() + Duration::from_secs(self.config.startup);
+                }
             }
             Err(error) => {
                 let job = self.state.jobs.iter_mut().find(|j| j.id == id).unwrap();
@@ -275,83 +340,91 @@ impl Server {
     }
 
     fn update_running(&mut self) -> io::Result<()> {
-        let Some(running) = &mut self.running else {
-            return Ok(());
-        };
-        if running.exit.is_none() {
-            running.exit = running.child.try_wait()?;
-        }
-        if running.stopping.is_none() {
-            if running.exit.is_some() {
-                self.stop(Status::Succeeded, "process exited");
-            } else {
-                let estimate = self
-                    .state
-                    .jobs
-                    .iter()
-                    .find(|j| j.id == running.id)
-                    .unwrap()
-                    .estimate;
-                let limit = self.config.max_runtime.min(estimate.saturating_mul(3));
-                if running.started.elapsed() >= Duration::from_secs(limit) {
-                    self.stop(Status::Evicted, "runtime limit exceeded");
+        for id in self.running.keys().copied().collect::<Vec<_>>() {
+            let running = self.running.get_mut(&id).unwrap();
+            if running.exit.is_none() {
+                running.exit = running.child.try_wait()?;
+            }
+            if running.stopping.is_none() {
+                if running.exit.is_some() {
+                    self.stop(id, Status::Succeeded, "process exited");
+                } else {
+                    let estimate = self
+                        .state
+                        .jobs
+                        .iter()
+                        .find(|j| j.id == id)
+                        .unwrap()
+                        .estimate;
+                    let limit = self.config.max_runtime.min(estimate.saturating_mul(3));
+                    if running.started.elapsed() >= Duration::from_secs(limit) {
+                        self.stop(id, Status::Evicted, "runtime limit exceeded");
+                    }
                 }
             }
-        }
-        let running = self.running.as_mut().unwrap();
-        if let Some((since, _, _)) = &running.stopping {
+            let running = self.running.get_mut(&id).unwrap();
+            let Some((since, _, _)) = &running.stopping else {
+                continue;
+            };
+            let group_alive = group_exists(running.child.id());
             if since.elapsed() >= Duration::from_secs(2) {
                 signal_group(running.child.id(), libc::SIGKILL);
             }
-            if running.exit.is_some()
-                && (!group_exists(running.child.id()) || since.elapsed() >= Duration::from_secs(2))
-            {
-                let running = self.running.take().unwrap();
-                let (_, requested, detail) = running.stopping.unwrap();
-                let exit = running.exit.unwrap();
-                let job = self
-                    .state
-                    .jobs
-                    .iter_mut()
-                    .find(|j| j.id == running.id)
-                    .unwrap();
-                job.status = if requested == Status::Succeeded && !exit.success() {
-                    Status::Failed
-                } else {
-                    requested
-                };
-                job.exit_code = exit.code();
-                job.detail = if detail == "process exited" {
-                    None
-                } else {
-                    Some(detail)
-                };
-                job.finished = Some(now());
-                if matches!(job.status, Status::Succeeded | Status::Failed) {
-                    self.state
-                        .durations
-                        .push(running.started.elapsed().as_secs().max(1));
-                    if self.state.durations.len() > 10 {
-                        self.state.durations.remove(0);
-                    }
+            if running.exit.is_none() || (group_alive && since.elapsed() < Duration::from_secs(2)) {
+                continue;
+            }
+            let running = self.running.remove(&id).unwrap();
+            if group_alive {
+                self.state.recovery_pending = true;
+            }
+            let (_, requested, detail) = running.stopping.unwrap();
+            let exit = running.exit.unwrap();
+            let job = self.state.jobs.iter_mut().find(|j| j.id == id).unwrap();
+            job.status = if requested == Status::Succeeded && !exit.success() {
+                Status::Failed
+            } else {
+                requested
+            };
+            job.exit_code = exit.code();
+            job.detail = if detail == "process exited" {
+                None
+            } else {
+                Some(detail)
+            };
+            job.finished = Some(now());
+            if matches!(job.status, Status::Succeeded | Status::Failed) {
+                self.state
+                    .durations
+                    .push(running.started.elapsed().as_secs().max(1));
+                if self.state.durations.len() > 10 {
+                    self.state.durations.remove(0);
                 }
-                // Drop the lock only after terminating the process group. Descendants retain
-                // their inherited descriptor if they outlive this scheduler.
-                drop(running._lock);
+            }
+            // Descendants retain the lock if they outlive the scheduler.
+            drop(running._lock);
+            if running.exclusive {
                 if let Some(mut sample) = self.sample.take() {
                     signal_group(sample.child.id(), libc::SIGKILL);
                     let _ = sample.child.wait();
                 }
-                self.save()?;
             }
+            self.save()?;
         }
         Ok(())
     }
 
     fn update_sample(&mut self) -> io::Result<()> {
-        if self.config.idle_threshold == 0.0 || self.running.is_none() {
+        if self.config.idle_threshold == 0.0 {
             return Ok(());
         }
+        let Some(id) = self
+            .running
+            .iter()
+            .find(|(_, r)| r.exclusive)
+            .map(|(id, _)| *id)
+        else {
+            return Ok(());
+        };
         if let Some(sample) = &mut self.sample {
             let status = sample.child.try_wait()?;
             if status.is_none() && sample.started.elapsed() < Duration::from_secs(10) {
@@ -371,12 +444,12 @@ impl Server {
             } else {
                 None
             };
-            let running = self.running.as_mut().unwrap();
+            let running = self.running.get_mut(&id).unwrap();
             if let Some(value) = value {
                 if value < self.config.idle_threshold {
                     let since = running.low_since.get_or_insert_with(Instant::now);
                     if since.elapsed() >= Duration::from_secs(self.config.idle_seconds) {
-                        self.stop(Status::Evicted, "device utilization remained low");
+                        self.stop(id, Status::Evicted, "device utilization remained low");
                     }
                 } else {
                     running.low_since = None;
@@ -386,7 +459,7 @@ impl Server {
                 eprintln!("usage command failed or returned an invalid percentage");
             }
             self.next_sample = Instant::now() + Duration::from_secs(1);
-        } else if self.running.as_ref().unwrap().stopping.is_none()
+        } else if self.running.get(&id).unwrap().stopping.is_none()
             && Instant::now() >= self.next_sample
         {
             let output = private_file(&self.config.dir.join("usage.tmp"))?;
@@ -443,7 +516,7 @@ pub fn serve(config: Config) -> io::Result<()> {
         ));
     }
     let daemon_lock = open_lock(&config.dir.join("daemon.lock"))?;
-    if !try_lock(&daemon_lock)? {
+    if !try_lock(&daemon_lock, true)? {
         return Err(io::Error::other("scheduler is already running"));
     }
     let state_path = config.dir.join("state.json");
@@ -457,6 +530,7 @@ pub fn serve(config: Config) -> io::Result<()> {
             job.status,
             Status::Starting | Status::Running | Status::Stopping
         ) {
+            state.recovery_pending = true;
             job.status = Status::Interrupted;
             job.finished = Some(now());
             job.detail =
@@ -473,7 +547,8 @@ pub fn serve(config: Config) -> io::Result<()> {
     let mut server = Server {
         config,
         state,
-        running: None,
+        running: BTreeMap::new(),
+        draining: None,
         sample: None,
         next_sample: Instant::now(),
     };

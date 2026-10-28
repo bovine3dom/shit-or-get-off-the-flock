@@ -14,10 +14,13 @@ use std::thread;
 use std::time::Duration;
 
 const HELP: &str = "sogotf [--state-dir DIR] serve --lock PATH [options]
-sogotf [--state-dir DIR] [--wait] [--approx-execution-time SECONDS] -- COMMAND [ARGS...]
+sogotf [--state-dir DIR] [--wait] [--exclusive] [--approx-execution-time SECONDS] -- COMMAND [ARGS...]
 sogotf [--state-dir DIR] list | status ID | cancel ID
 
+Jobs share the device by default; --exclusive requires sole access.
+
 Server options:
+  --max-shared JOBS           Maximum concurrent shared jobs (default: 10)
   --max-runtime SECONDS       Hard runtime limit (default: 86400)
   --default-estimate SECONDS  Estimate without history (default: 3600)
   --startup SECONDS           Idle-check grace period (default: 60)
@@ -75,6 +78,7 @@ fn run() -> Result<i32, String> {
         let mut config = server::Config {
             dir,
             lock: PathBuf::new(),
+            max_shared: 10,
             max_runtime: 86400,
             default_estimate: 3600,
             startup: 60,
@@ -86,6 +90,9 @@ fn run() -> Result<i32, String> {
         while i < rest.len() {
             match rest[i].as_str() {
                 "--lock" => config.lock = PathBuf::from(value(rest, &mut i)?),
+                "--max-shared" => {
+                    config.max_shared = number(&value(rest, &mut i)?, "max shared jobs")?
+                }
                 "--max-runtime" => {
                     config.max_runtime = number(&value(rest, &mut i)?, "max runtime")?
                 }
@@ -106,6 +113,9 @@ fn run() -> Result<i32, String> {
         }
         if config.lock.as_os_str().is_empty() {
             return Err("serve requires --lock PATH".into());
+        }
+        if config.max_shared == 0 {
+            return Err("max shared jobs must be positive".into());
         }
         if config.max_runtime == 0
             || config.default_estimate == 0
@@ -152,11 +162,13 @@ fn run() -> Result<i32, String> {
         _ => {}
     }
     let mut wait = false;
+    let mut exclusive = false;
     let mut estimate = None;
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
             "--wait" => wait = true,
+            "--exclusive" => exclusive = true,
             "--approx-execution-time" => {
                 estimate = Some(number(&value(rest, &mut i)?, "estimate")?)
             }
@@ -194,12 +206,13 @@ fn run() -> Result<i32, String> {
             cwd,
             env: environment,
             estimate,
+            exclusive,
         },
     )?;
     let id = response.jobs[0].id;
     match response.wait_seconds {
         Some(seconds) => println!("job {id}: estimated time until start: {seconds}s"),
-        None => println!("job {id}: estimated time until start: unknown (external lock held)"),
+        None => println!("job {id}: estimated time until start: unknown (external lock held or recovery pending)"),
     }
     println!(
         "stdout: {}\nstderr: {}",
