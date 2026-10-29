@@ -103,7 +103,20 @@ impl Harness {
             .unwrap()
     }
     fn run(&self, args: &[&str]) -> Output {
-        let output = self.invoke(args);
+        // Synthetic CPU workloads reference the allocation without changing their timing.
+        let mut command = args.to_vec();
+        if (args.contains(&"--cpu") || args.contains(&"--exclusive"))
+            && !args.contains(&"--threads")
+            && !args.iter().any(|arg| arg.contains("SOGOTF_THREADS"))
+        {
+            if let Some(index) = command.iter().position(|arg| *arg == "--") {
+                command.splice(
+                    index + 1..index + 1,
+                    ["/bin/sh", "-c", ": \"$SOGOTF_THREADS\"; exec \"$@\"", "sh"],
+                );
+            }
+        }
+        let output = self.invoke(&command);
         assert!(
             output.status.success(),
             "{}",
@@ -784,6 +797,59 @@ fn fixed_threads_work_with_legacy_exclusive_flag() {
 }
 
 #[test]
+fn cpu_jobs_require_a_thread_declaration() {
+    let h = Harness::new(&["--cpu-threads", "4", "--batch-ms", "0"]);
+    for args in [
+        vec!["--cpu", "shared", "--", "/bin/true"],
+        vec!["--cpu", "exclusive", "--", "/bin/true"],
+        vec!["--gpu", "shared", "--cpu", "shared", "--", "/bin/true"],
+        vec!["--exclusive", "--", "/bin/true"],
+    ] {
+        let output = h.invoke(&args);
+        assert!(!output.status.success(), "request accepted: {args:?}");
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains("--threads N") && error.contains("SOGOTF_THREADS"),
+            "{error}"
+        );
+    }
+    let mut stream = UnixStream::connect(h.dir.join("scheduler.sock")).unwrap();
+    let request = serde_json::json!({"Submit": {"command": ["/bin/true"], "cwd": "/", "env": [["SOGOTF_THREADS", "1"]], "estimate": 1, "exclusive": true}});
+    writeln!(stream, "{request}").unwrap();
+    let mut response = String::new();
+    BufReader::new(stream).read_line(&mut response).unwrap();
+    let response: Value = serde_json::from_str(&response).unwrap();
+    assert!(response["error"]
+        .as_str()
+        .unwrap()
+        .contains("SOGOTF_THREADS"));
+    assert!(
+        serde_json::from_slice::<Vec<Value>>(&h.run(&["list"]).stdout)
+            .unwrap()
+            .is_empty()
+    );
+
+    h.run(&["--gpu", "shared", "--", "/bin/true"]);
+    h.run(&["--cpu", "shared", "--threads", "1", "--", "/bin/true"]);
+    let adaptive = h.invoke(&[
+        "--cpu",
+        "shared",
+        "--",
+        "/bin/sh",
+        "-c",
+        "test \"$SOGOTF_THREADS\" -gt 0",
+    ]);
+    assert!(
+        adaptive.status.success(),
+        "{}",
+        String::from_utf8_lossy(&adaptive.stderr)
+    );
+    for id in 1..=3 {
+        h.wait_status(id, &["succeeded"]);
+    }
+}
+
+#[test]
 fn invalid_fixed_thread_requests_are_rejected() {
     let h = Harness::new(&["--cpu-threads", "60"]);
     for args in [
@@ -1066,7 +1132,7 @@ fn old_queued_exclusive_job_migrates_to_both_resources() {
 fn old_client_exclusive_request_uses_both_resources() {
     let h = Harness::new(&["--cpu-threads", "6"]);
     let mut stream = UnixStream::connect(h.dir.join("scheduler.sock")).unwrap();
-    let request = serde_json::json!({"Submit": {"command": ["/bin/sleep", "3"], "cwd": "/", "env": [], "estimate": 5, "exclusive": true}});
+    let request = serde_json::json!({"Submit": {"command": ["/bin/sh", "-c", ": \"$SOGOTF_THREADS\"; exec /bin/sleep 3"], "cwd": "/", "env": [], "estimate": 5, "exclusive": true}});
     writeln!(stream, "{request}").unwrap();
     let mut response = String::new();
     BufReader::new(stream).read_line(&mut response).unwrap();

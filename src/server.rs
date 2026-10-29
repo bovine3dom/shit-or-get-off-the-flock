@@ -200,6 +200,14 @@ impl Server {
                 if command.is_empty() || command[0].is_empty() {
                     return Ok(Response::error("command is empty"));
                 }
+                if cpu.is_some()
+                    && requested_threads.is_none()
+                    && !command.iter().any(|arg| arg.contains("SOGOTF_THREADS"))
+                {
+                    return Ok(Response::error(
+                        "CPU jobs require --threads N or SOGOTF_THREADS in the command; for parallel jobs, use SOGOTF_THREADS to set the thread or job count (quote shell commands so it expands in the job)",
+                    ));
+                }
                 let estimate = estimate.unwrap_or_else(|| {
                     if self.state.durations.is_empty() {
                         self.config.default_estimate

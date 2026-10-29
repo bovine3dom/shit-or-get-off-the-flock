@@ -20,8 +20,8 @@ sogotf [--state-dir DIR] list | status ID | cancel ID | drain [--wait] | resume
 
 --cpu and --gpu accept shared or exclusive. With no resource options, jobs
 share the GPU; --exclusive requests exclusive CPU and GPU.
---threads N reserves an exact CPU thread count. Use it as a last resort for
-fixed-thread programs; prefer SOGOTF_THREADS when possible.
+CPU jobs require --threads N or SOGOTF_THREADS in the command.
+Use SOGOTF_THREADS to set parallelism; --threads N reserves a fixed count.
 
 Server options:
   --cpu-lock PATH             CPU flock file (default: STATE_DIR/cpu.lock)

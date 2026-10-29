@@ -72,19 +72,19 @@ systemd stops the service's running jobs during a direct stop or restart. use th
 sogotf --approx-execution-time 120 -- python train.py
 
 # the old --exclusive flag takes both CPU and GPU exclusively
-sogotf --exclusive --wait --approx-execution-time 10 -- ./render --frames 20
+sogotf --exclusive --threads 1 --wait --approx-execution-time 10 -- ./render --frames 20
 
 # CPU only, with an exclusive or shared allocation
 sogotf --cpu exclusive -- sh -c 'exec make -j "$SOGOTF_THREADS"'
 sogotf --cpu shared -- sh -c 'exec make -j "$SOGOTF_THREADS"'
 
-# last resort for a program that uses a fixed number of threads
+# reserve threads for a program that uses a fixed number
 sogotf --cpu shared --threads 8 -- ./fixed-thread-program
 
 # choose each resource independently
-sogotf --gpu shared --cpu shared -- ./train
-sogotf --gpu exclusive --cpu shared -- ./train
-sogotf --gpu exclusive --cpu exclusive -- ./train
+sogotf --gpu shared --cpu shared --threads 1 -- ./train
+sogotf --gpu exclusive --cpu shared --threads 1 -- ./train
+sogotf --gpu exclusive --cpu exclusive --threads 1 -- ./train
 
 sogotf list
 sogotf status 1
@@ -115,7 +115,9 @@ shared CPU jobs ready together get an equal share of the free threads, with any 
 
 each CPU job receives its allocation as `SOGOTF_THREADS`, and `status` reports it in `threads`. the allocation stays fixed until the job exits, so a job that takes all the threads can make later jobs wait. the budget is cooperative: adaptive jobs use the variable to set their thread count, and fixed jobs use their reserved count.
 
-**last resort:** use `--threads N` for a program with a fixed thread count. prefer `SOGOTF_THREADS` for other programs so the scheduler can divide the available threads between jobs. `--threads` reserves exactly `N` threads; within each batch, the scheduler reserves fixed requests first and divides the rest among adaptive jobs. `status` shows the fixed request in `requested_threads`.
+CPU jobs must specify `--threads N` or include `SOGOTF_THREADS` in the submitted command. use `SOGOTF_THREADS` to set the thread or job count for programs that support variable parallelism. use `--threads N` for a program with a fixed thread count. `--threads` reserves exactly `N` threads; within each batch, the scheduler reserves fixed requests first and divides the rest among adaptive jobs. `status` shows the fixed request in `requested_threads`.
+
+quote shell commands so `SOGOTF_THREADS` expands in the job. if a script reads the variable internally, reference it in the submitted command, for example `sh -c 'export SOGOTF_THREADS; exec ./script'`. the check examines the command arguments. the program must use its allocation correctly. queued jobs accepted before this check keep their place.
 
 `--threads` requires `--cpu` or `--exclusive`, and `N` must be between 1 and the configured CPU thread budget. an exclusive CPU job still keeps the whole CPU to itself, even when its fixed count is smaller. if the CPU budget is reduced on restart, queued jobs that exceed the new budget fail.
 
