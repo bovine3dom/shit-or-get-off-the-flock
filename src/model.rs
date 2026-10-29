@@ -24,6 +24,13 @@ impl Status {
     }
 }
 
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Access {
+    Shared,
+    Exclusive,
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct Job {
     pub id: u64,
@@ -34,6 +41,16 @@ pub struct Job {
     pub estimate: u64,
     #[serde(default = "legacy_exclusive")]
     pub exclusive: bool,
+    #[serde(default = "default_gpu")]
+    pub gpu: bool,
+    #[serde(default)]
+    pub cpu: Option<Access>,
+    #[serde(default)]
+    pub threads: Option<usize>,
+    #[serde(default)]
+    pub requested_threads: Option<usize>,
+    #[serde(default)]
+    pub resources_explicit: bool,
     pub started: Option<u64>,
     pub finished: Option<u64>,
     pub status: Status,
@@ -54,6 +71,10 @@ fn legacy_exclusive() -> bool {
     true
 }
 
+fn default_gpu() -> bool {
+    true
+}
+
 #[derive(Serialize, Deserialize)]
 pub enum Request {
     Submit {
@@ -63,6 +84,14 @@ pub enum Request {
         estimate: Option<u64>,
         #[serde(default = "legacy_exclusive")]
         exclusive: bool,
+        #[serde(default = "default_gpu")]
+        gpu: bool,
+        #[serde(default)]
+        cpu: Option<Access>,
+        #[serde(default)]
+        requested_threads: Option<usize>,
+        #[serde(default)]
+        resources_explicit: bool,
     },
     List,
     Get {
@@ -125,37 +154,6 @@ pub fn ordered(state: &State) -> Vec<&Job> {
     jobs
 }
 
-pub fn estimate_wait(
-    state: &State,
-    id: u64,
-    active: &[(u64, bool)],
-    max_shared: usize,
-    reserved: Option<u64>,
-) -> Option<u64> {
-    let mut active = active.to_vec();
-    let mut jobs = ordered(state);
-    if let Some(index) = jobs.iter().position(|j| Some(j.id) == reserved) {
-        let job = jobs.remove(index);
-        jobs.insert(0, job);
-    }
-    let mut time = 0;
-    for job in jobs {
-        active.retain(|(end, _)| *end > time);
-        if job.exclusive || active.iter().any(|(_, exclusive)| *exclusive) {
-            time = active.iter().map(|(end, _)| *end).max().unwrap_or(time);
-            active.clear();
-        } else if active.len() >= max_shared {
-            time = active.iter().map(|(end, _)| *end).min().unwrap();
-            active.retain(|(end, _)| *end > time);
-        }
-        if job.id == id {
-            return Some(time);
-        }
-        active.push((time.saturating_add(job.estimate), job.exclusive));
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,6 +166,11 @@ mod tests {
             submitted,
             estimate,
             exclusive: true,
+            gpu: true,
+            cpu: None,
+            threads: None,
+            requested_threads: None,
+            resources_explicit: true,
             started: None,
             finished: None,
             status: Status::Queued,
@@ -187,8 +190,6 @@ mod tests {
             ordered(&state).iter().map(|j| j.id).collect::<Vec<_>>(),
             vec![2, 1, 3]
         );
-        assert_eq!(estimate_wait(&state, 1, &[(7, true)], 10, None), Some(12));
-        assert_eq!(estimate_wait(&state, 3, &[(7, true)], 10, None), Some(112));
     }
 
     #[test]
@@ -204,21 +205,5 @@ mod tests {
                 ..
             }
         ));
-    }
-
-    #[test]
-    fn estimates_parallel_slots_and_exclusive_draining() {
-        let mut state = State {
-            jobs: vec![job(1, 0, 3), job(2, 1, 4), job(3, 2, 5)],
-            ..State::default()
-        };
-        state.jobs[0].exclusive = false;
-        state.jobs[1].exclusive = false;
-        assert_eq!(estimate_wait(&state, 2, &[(5, false)], 2, None), Some(3));
-        assert_eq!(estimate_wait(&state, 3, &[(5, false)], 2, None), Some(7));
-        assert_eq!(
-            estimate_wait(&state, 2, &[(5, false)], 2, Some(3)),
-            Some(10)
-        );
     }
 }

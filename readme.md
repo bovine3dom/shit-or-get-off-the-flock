@@ -1,6 +1,6 @@
 # shit or get off the flock (sogotf)
 
-dead simple queue for shared and exclusive device use. short jobs jump the queue
+dead simple queue for shared and exclusive CPU and GPU use. short jobs jump the queue
 
 ## build
 
@@ -12,11 +12,13 @@ find the binary at `target/release/sogotf`. u might need to install `flock` or s
 
 ## run
 
-one scheduler per lock:
+start a scheduler with a GPU lock, a CPU lock and a thread budget:
 
 ```sh
-sogotf serve --lock /tmp/gpu.lock
+sogotf serve --lock /tmp/gpu.lock --cpu-lock /tmp/cpu.lock --cpu-threads 60
 ```
+
+the CPU lock defaults to `cpu.lock` in the state directory, and the thread budget defaults to the detected CPU count.
 
 the scheduler runs in the foreground. probably best to run it as a service. other jobs can use the same lock:
 
@@ -24,9 +26,11 @@ the scheduler runs in the foreground. probably best to run it as a service. othe
 flock /tmp/gpu.lock your-existing-command
 ```
 
-jobs share the device by default, with up to 10 running together. set another limit with `--max-shared`; external shared lock holders use additional slots. existing exclusive lock users wait for shared jobs to finish.
+jobs using the old interface share the GPU by default, with up to 10 running together. set another limit with `--max-shared`; the limit applies to each resource, and external shared lock holders use additional slots.
 
-for multiple devices, give each scheduler its own lock and state directory. set the directory with `--state-dir DIR` before the command, or with `SOGOTF_DIR`; the default is `~/.local/state/sogotf`. the directory must belong to the scheduler user and have mode `0700`.
+each scheduler manages one GPU lock and one CPU lock. use one scheduler for each CPU thread budget: separate schedulers share exclusive locks, but each keeps its own thread count. external CPU jobs can use the CPU lock in the same way as the GPU lock.
+
+set the state directory with `--state-dir DIR` before the command, or with `SOGOTF_DIR`; the default is `~/.local/state/sogotf`. the directory must belong to the scheduler user and have mode `0700`.
 
 ## systemd
 
@@ -67,13 +71,27 @@ systemd stops the service's running jobs when you stop or restart the service; t
 # queue and get a job id and estimated wait. all times in seconds
 sogotf --approx-execution-time 120 -- python train.py
 
-# queue an exclusive job and wait for the result
+# the old --exclusive flag takes both CPU and GPU exclusively
 sogotf --exclusive --wait --approx-execution-time 10 -- ./render --frames 20
+
+# CPU only, with an exclusive or shared allocation
+sogotf --cpu exclusive -- sh -c 'exec make -j "$SOGOTF_THREADS"'
+sogotf --cpu shared -- sh -c 'exec make -j "$SOGOTF_THREADS"'
+
+# last resort for a program that uses a fixed number of threads
+sogotf --cpu shared --threads 8 -- ./fixed-thread-program
+
+# choose each resource independently
+sogotf --gpu shared --cpu shared -- ./train
+sogotf --gpu exclusive --cpu shared -- ./train
+sogotf --gpu exclusive --cpu exclusive -- ./train
 
 sogotf list
 sogotf status 1
 sogotf cancel 1
 ```
+
+`--cpu` and `--gpu` accept `shared` or `exclusive`. specifying only one requests only that resource; without either option, jobs use the GPU in shared mode. the old `--exclusive` flag requests both resources exclusively.
 
 jobs get the submitter's working directory and environment, with stdout and stderr saved to `ID.stdout` and `ID.stderr` in the state directory. `--wait` returns the job's exit code when available. interrupting the client leaves the job queued. use `cancel` to stop a job.
 
@@ -83,19 +101,29 @@ jobs get the submitter's working directory and environment, with stdout and stde
 
 each job gets a target of submission time + 2 × estimated runtime, and the earliest target runs first. short jobs can jump ahead, while older jobs eventually take priority over new arrivals.
 
-when an exclusive job reaches the front while shared jobs are running, the scheduler lets those jobs finish before starting it. new shared jobs wait until the exclusive job has run.
+when an exclusive job reaches the front while shared jobs are running, the scheduler lets those jobs finish before starting it. new jobs needing the same resources wait, while jobs using independent resources can run.
 
 the target is a goal, and running jobs, external lock holders or bad estimates can make you wait longer.
 
-the estimated wait accounts for running jobs, shared slots and jobs ahead; new jobs can change it, and an external lock holder can make it unknown.
+the estimated wait simulates running jobs, fixed thread allocations, batching and jobs ahead. an external lock can make the wait unknown, while independent jobs can still get an estimate. external shared holders can be hard to distinguish while sogotf holds a shared lock; new jobs and inaccurate runtimes can also change the wait.
 
 give each job a runtime estimate in seconds, or let the scheduler use the mean of the last 10 completed jobs. when the history is empty, it uses the configured default; the estimate stays fixed after submission.
+
+## CPU threads
+
+shared CPU jobs ready together get an equal share of the free threads, with any remainder given to the first jobs in the queue. the scheduler waits `--batch-ms` (1000 by default) to collect a batch; `0` starts jobs immediately. exclusive CPU jobs reserve the whole CPU and get the full thread budget by default.
+
+each CPU job receives its allocation as `SOGOTF_THREADS`, and `status` reports it in `threads`. the allocation stays fixed until the job exits, so a job that takes all the threads can make later jobs wait. the budget is cooperative: adaptive jobs use the variable to set their thread count, and fixed jobs use their reserved count.
+
+**last resort:** use `--threads N` for a program with a fixed thread count. prefer `SOGOTF_THREADS` for other programs so the scheduler can divide the available threads between jobs. `--threads` reserves exactly `N` threads; within each batch, the scheduler reserves fixed requests first and divides the rest among adaptive jobs. `status` shows the fixed request in `requested_threads`.
+
+`--threads` requires `--cpu` or `--exclusive`, and `N` must be between 1 and the configured CPU thread budget. an exclusive CPU job still keeps the whole CPU to itself, even when its fixed count is smaller. if the CPU budget is reduced on restart, queued jobs that exceed the new budget fail.
 
 ## eviction
 
 jobs get kicked off after `--max-runtime` or 3 × their estimated runtime, whichever comes first; the clock starts at launch. estimates above the maximum are rejected.
 
-idle eviction applies to exclusive jobs and is off by default. to kick exclusive jobs off GPU 0 after utilization stays below 10% for 120 seconds:
+idle eviction applies to jobs with exclusive GPU access and is off by default. to kick those jobs off GPU 0 after utilization stays below 10% for 120 seconds:
 
 ```sh
 sogotf serve --lock /tmp/gpu.lock \
@@ -109,8 +137,11 @@ device utilization includes other processes, and jobs can go quiet while loading
 
 | option | default | what it does |
 | --- | --- | --- |
-| `--lock PATH` | required | shared `flock` file |
-| `--max-shared JOBS` | 10 | maximum concurrent shared jobs |
+| `--lock PATH` | required | GPU `flock` file |
+| `--cpu-lock PATH` | state directory `cpu.lock` | CPU `flock` file |
+| `--cpu-threads THREADS` | detected CPU count | CPU thread budget |
+| `--batch-ms MILLISECONDS` | 1000 | shared CPU batching window |
+| `--max-shared JOBS` | 10 | maximum shared jobs per resource |
 | `--max-runtime SECONDS` | 86400 | maximum job runtime |
 | `--default-estimate SECONDS` | 3600 | estimate before history exists |
 | `--startup SECONDS` | 60 | grace period before idle sampling |
@@ -124,7 +155,7 @@ on cancellation or eviction, the scheduler sends `SIGTERM` to the job's process 
 
 jobs inherit the lock descriptor, so a job can keep running and hold the lock if the scheduler dies. the lock stays held until its processes close the descriptor or exit.
 
-on restart, the scheduler marks starting or running jobs as interrupted and waits for the device lock to become free before continuing the queue. interrupted jobs need manual supervision, and processes that close the descriptor or escape the group need their own cleanup. jobs queued with an older version keep exclusive access.
+on restart, the scheduler marks starting or running jobs as interrupted and waits for both locks to become free before continuing the queue. interrupted jobs need manual supervision, and processes that close the descriptors or escape the group need their own cleanup. exclusive jobs queued with an older version take both CPU and GPU exclusively.
 
 ## tests
 

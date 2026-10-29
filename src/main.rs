@@ -2,9 +2,10 @@
 compile_error!("sogotf currently supports Unix systems only");
 
 mod model;
+mod scheduler;
 mod server;
 
-use model::{Request, Response, Status};
+use model::{Access, Request, Response, Status};
 use std::env;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -14,12 +15,18 @@ use std::thread;
 use std::time::Duration;
 
 const HELP: &str = "sogotf [--state-dir DIR] serve --lock PATH [options]
-sogotf [--state-dir DIR] [--wait] [--exclusive] [--approx-execution-time SECONDS] -- COMMAND [ARGS...]
+sogotf [--state-dir DIR] [--wait] [--exclusive | [--cpu MODE] [--gpu MODE]] [--threads N] [--approx-execution-time SECONDS] -- COMMAND [ARGS...]
 sogotf [--state-dir DIR] list | status ID | cancel ID
 
-Jobs share the device by default; --exclusive requires sole access.
+--cpu and --gpu accept shared or exclusive. With no resource options, jobs
+share the GPU; --exclusive requests exclusive CPU and GPU.
+--threads N reserves an exact CPU thread count. Use it as a last resort for
+fixed-thread programs; prefer SOGOTF_THREADS when possible.
 
 Server options:
+  --cpu-lock PATH             CPU flock file (default: STATE_DIR/cpu.lock)
+  --cpu-threads THREADS       Available CPU threads (default: detected CPUs)
+  --batch-ms MILLISECONDS     CPU shared-job batching window (default: 1000)
   --max-shared JOBS           Maximum concurrent shared jobs (default: 10)
   --max-runtime SECONDS       Hard runtime limit (default: 86400)
   --default-estimate SECONDS  Estimate without history (default: 3600)
@@ -39,6 +46,16 @@ fn value(args: &[String], i: &mut usize) -> Result<String, String> {
 
 fn number<T: std::str::FromStr>(s: &str, name: &str) -> Result<T, String> {
     s.parse().map_err(|_| format!("invalid {name}: {s}"))
+}
+
+fn access(value: &str) -> Result<Access, String> {
+    match value {
+        "shared" => Ok(Access::Shared),
+        "exclusive" => Ok(Access::Exclusive),
+        _ => Err(format!(
+            "invalid resource mode: {value}; use shared or exclusive"
+        )),
+    }
 }
 
 fn request(dir: &Path, request: &Request) -> Result<Response, String> {
@@ -76,8 +93,13 @@ fn run() -> Result<i32, String> {
     }
     if rest[0] == "serve" {
         let mut config = server::Config {
+            cpu_lock: dir.join("cpu.lock"),
             dir,
             lock: PathBuf::new(),
+            cpu_threads: std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1),
+            batch_ms: 1000,
             max_shared: 10,
             max_runtime: 86400,
             default_estimate: 3600,
@@ -90,6 +112,11 @@ fn run() -> Result<i32, String> {
         while i < rest.len() {
             match rest[i].as_str() {
                 "--lock" => config.lock = PathBuf::from(value(rest, &mut i)?),
+                "--cpu-lock" => config.cpu_lock = PathBuf::from(value(rest, &mut i)?),
+                "--cpu-threads" => {
+                    config.cpu_threads = number(&value(rest, &mut i)?, "CPU threads")?
+                }
+                "--batch-ms" => config.batch_ms = number(&value(rest, &mut i)?, "batch window")?,
                 "--max-shared" => {
                     config.max_shared = number(&value(rest, &mut i)?, "max shared jobs")?
                 }
@@ -113,6 +140,9 @@ fn run() -> Result<i32, String> {
         }
         if config.lock.as_os_str().is_empty() {
             return Err("serve requires --lock PATH".into());
+        }
+        if config.cpu_threads == 0 {
+            return Err("CPU threads must be positive".into());
         }
         if config.max_shared == 0 {
             return Err("max shared jobs must be positive".into());
@@ -163,12 +193,18 @@ fn run() -> Result<i32, String> {
     }
     let mut wait = false;
     let mut exclusive = false;
+    let mut gpu = None;
+    let mut cpu = None;
+    let mut requested_threads = None;
     let mut estimate = None;
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
             "--wait" => wait = true,
             "--exclusive" => exclusive = true,
+            "--cpu" => cpu = Some(access(&value(rest, &mut i)?)?),
+            "--gpu" => gpu = Some(access(&value(rest, &mut i)?)?),
+            "--threads" => requested_threads = Some(number(&value(rest, &mut i)?, "thread count")?),
             "--approx-execution-time" => {
                 estimate = Some(number(&value(rest, &mut i)?, "estimate")?)
             }
@@ -183,6 +219,22 @@ fn run() -> Result<i32, String> {
     }
     if i >= rest.len() {
         return Err("a command is required".into());
+    }
+    if exclusive && (cpu.is_some() || gpu.is_some()) {
+        return Err("--exclusive cannot be combined with --cpu or --gpu".into());
+    }
+    if exclusive {
+        cpu = Some(Access::Exclusive);
+        gpu = Some(Access::Exclusive);
+    }
+    if cpu.is_none() && gpu.is_none() {
+        gpu = Some(Access::Shared);
+    }
+    if requested_threads.is_some() && cpu.is_none() {
+        return Err("--threads requires --cpu or --exclusive".into());
+    }
+    if requested_threads == Some(0) {
+        return Err("thread count must be positive".into());
     }
     let cwd = env::current_dir()
         .map_err(|e| e.to_string())?
@@ -206,13 +258,19 @@ fn run() -> Result<i32, String> {
             cwd,
             env: environment,
             estimate,
-            exclusive,
+            exclusive: gpu == Some(Access::Exclusive),
+            gpu: gpu.is_some(),
+            cpu,
+            requested_threads,
+            resources_explicit: true,
         },
     )?;
     let id = response.jobs[0].id;
     match response.wait_seconds {
         Some(seconds) => println!("job {id}: estimated time until start: {seconds}s"),
-        None => println!("job {id}: estimated time until start: unknown (external lock held or recovery pending)"),
+        None => println!(
+            "job {id}: estimated time until start: unknown (resource availability or recovery)"
+        ),
     }
     println!(
         "stdout: {}\nstderr: {}",

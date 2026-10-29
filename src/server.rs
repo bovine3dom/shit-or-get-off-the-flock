@@ -1,4 +1,5 @@
-use crate::model::{estimate_wait, now, ordered, Job, Request, Response, State, Status};
+use crate::model::{now, ordered, Access, Job, Request, Response, State, Status};
+use crate::scheduler::{estimate_wait, plan, Limits, Planned, Queued, Resources, Timed};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
@@ -14,6 +15,9 @@ use std::time::{Duration, Instant};
 pub struct Config {
     pub dir: PathBuf,
     pub lock: PathBuf,
+    pub cpu_lock: PathBuf,
+    pub cpu_threads: usize,
+    pub batch_ms: u64,
     pub max_shared: usize,
     pub max_runtime: u64,
     pub default_estimate: u64,
@@ -25,8 +29,8 @@ pub struct Config {
 
 struct Running {
     child: Child,
-    _lock: File,
-    exclusive: bool,
+    _locks: Vec<File>,
+    resources: Resources,
     started: Instant,
     low_since: Option<Instant>,
     stopping: Option<(Instant, Status, String)>,
@@ -43,6 +47,8 @@ struct Server {
     state: State,
     running: BTreeMap<u64, Running>,
     draining: Option<u64>,
+    batch_deadline: Option<u64>,
+    clock: Instant,
     sample: Option<Sample>,
     next_sample: Instant,
 }
@@ -83,6 +89,35 @@ fn try_lock(file: &File, exclusive: bool) -> io::Result<bool> {
     }
 }
 
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn external_mode(path: &Path) -> io::Result<Option<Access>> {
+    let file = open_lock(path)?;
+    if try_lock(&file, true)? {
+        Ok(None)
+    } else if try_lock(&file, false)? {
+        Ok(Some(Access::Shared))
+    } else {
+        Ok(Some(Access::Exclusive))
+    }
+}
+
+fn acquire_locks(gpu: &Path, cpu: &Path, resources: Resources) -> io::Result<Option<Vec<File>>> {
+    let mut locks = Vec::new();
+    for (path, mode) in [(gpu, resources.gpu), (cpu, resources.cpu)] {
+        if let Some(mode) = mode {
+            let file = open_lock(path)?;
+            if !try_lock(&file, mode == Access::Exclusive)? {
+                return Ok(None);
+            }
+            locks.push(file);
+        }
+    }
+    Ok(Some(locks))
+}
+
 fn signal_group(pid: u32, signal: i32) {
     unsafe {
         libc::kill(-(pid as i32), signal);
@@ -104,15 +139,30 @@ impl Server {
         File::open(&self.config.dir)?.sync_all()
     }
 
-    fn external_lock(&self, exclusive: bool) -> io::Result<bool> {
-        if self.state.recovery_pending {
-            return Ok(true);
+    fn limits(&self) -> Limits {
+        Limits {
+            max_shared: self.config.max_shared,
+            cpu_threads: self.config.cpu_threads,
+            batch_ms: self.config.batch_ms,
         }
-        if !self.running.is_empty() {
-            return Ok(false);
-        }
-        let file = open_lock(&self.config.lock)?;
-        Ok(!try_lock(&file, exclusive)?)
+    }
+
+    fn external_locks(&self) -> io::Result<Resources> {
+        let gpu = if self.running.values().any(|r| r.resources.gpu.is_some()) {
+            None
+        } else {
+            external_mode(&self.config.lock)?
+        };
+        let cpu = if self.running.values().any(|r| r.resources.cpu.is_some()) {
+            None
+        } else {
+            external_mode(&self.config.cpu_lock)?
+        };
+        Ok(Resources {
+            gpu,
+            cpu,
+            threads: 0,
+        })
     }
 
     fn request(&mut self, request: Request) -> io::Result<Response> {
@@ -123,7 +173,26 @@ impl Server {
                 env,
                 estimate,
                 exclusive,
+                gpu,
+                mut cpu,
+                requested_threads,
+                resources_explicit,
             } => {
+                if !resources_explicit && exclusive {
+                    cpu = Some(Access::Exclusive);
+                }
+                if !gpu && cpu.is_none() {
+                    return Ok(Response::error("at least one resource is required"));
+                }
+                if requested_threads.is_some() && cpu.is_none() {
+                    return Ok(Response::error("thread count requires a CPU resource"));
+                }
+                if requested_threads.is_some_and(|n| n == 0 || n > self.config.cpu_threads) {
+                    return Ok(Response::error(format!(
+                        "thread count must be between 1 and {}",
+                        self.config.cpu_threads
+                    )));
+                }
                 if command.is_empty() || command[0].is_empty() {
                     return Ok(Response::error("command is empty"));
                 }
@@ -153,43 +222,51 @@ impl Server {
                     submitted: now(),
                     estimate,
                     exclusive,
+                    gpu,
+                    cpu,
+                    threads: None,
+                    requested_threads,
+                    resources_explicit: true,
                     started: None,
                     finished: None,
                     status: Status::Queued,
                     exit_code: None,
                     detail: None,
                 });
-                let active: Vec<_> = self
+                let active = self
                     .running
                     .iter()
                     .map(|(id, r)| {
                         let job = self.state.jobs.iter().find(|j| j.id == *id).unwrap();
-                        (
-                            job.estimate.saturating_sub(r.started.elapsed().as_secs()),
-                            r.exclusive,
-                        )
+                        Timed {
+                            resources: r.resources,
+                            end_ms: job
+                                .estimate
+                                .saturating_mul(1000)
+                                .saturating_sub(millis(r.started.elapsed())),
+                        }
                     })
                     .collect();
-                let needs_exclusive = self.draining.is_some()
-                    || ordered(&self.state)
-                        .iter()
-                        .take_while(|j| j.id != id)
-                        .any(|j| j.exclusive)
-                    || exclusive;
-                let external = self.external_lock(needs_exclusive)?;
-                self.save()?;
-                let mut response = Response::jobs(vec![self.state.jobs.last().unwrap().clone()]);
-                response.wait_seconds = if external {
+                let queue = ordered(&self.state).into_iter().map(Queued::job).collect();
+                let deadline = self
+                    .batch_deadline
+                    .map(|t| t.saturating_sub(millis(self.clock.elapsed())));
+                let wait = if self.state.recovery_pending {
                     None
                 } else {
                     estimate_wait(
-                        &self.state,
+                        queue,
                         id,
-                        &active,
-                        self.config.max_shared,
+                        active,
+                        self.limits(),
                         self.draining,
+                        deadline,
+                        self.external_locks()?,
                     )
                 };
+                self.save()?;
+                let mut response = Response::jobs(vec![self.state.jobs.last().unwrap().clone()]);
+                response.wait_seconds = wait;
                 Ok(response)
             }
             Request::List => Ok(Response::jobs(self.state.jobs.clone())),
@@ -238,63 +315,64 @@ impl Server {
             if !self.running.is_empty() {
                 return Ok(());
             }
-            let lock = open_lock(&self.config.lock)?;
-            if !try_lock(&lock, true)? {
+            let both = Resources {
+                gpu: Some(Access::Exclusive),
+                cpu: Some(Access::Exclusive),
+                threads: 0,
+            };
+            let Some(_locks) = acquire_locks(&self.config.lock, &self.config.cpu_lock, both)?
+            else {
                 return Ok(());
-            }
+            };
             self.state.recovery_pending = false;
             self.save()?;
         }
-        if self.draining.is_some_and(|id| {
-            !self
-                .state
-                .jobs
-                .iter()
-                .any(|j| j.id == id && j.status == Status::Queued)
-        }) {
-            self.draining = None;
+        let jobs: Vec<_> = ordered(&self.state).into_iter().map(Queued::job).collect();
+        let active: Vec<_> = self.running.values().map(|r| r.resources).collect();
+        let limits = self.limits();
+        let gpu = &self.config.lock;
+        let cpu = &self.config.cpu_lock;
+        let planned = plan(
+            &jobs,
+            &active,
+            &mut self.draining,
+            &mut self.batch_deadline,
+            millis(self.clock.elapsed()),
+            limits,
+            |resources| acquire_locks(gpu, cpu, resources),
+        )?;
+        for job in planned {
+            self.start_job(job)?;
         }
-        let next = self
-            .draining
-            .and_then(|id| self.state.jobs.iter().find(|j| j.id == id))
-            .or_else(|| ordered(&self.state).first().copied());
-        let Some(job) = next else {
-            return Ok(());
-        };
-        let (id, exclusive) = (job.id, job.exclusive);
-        if exclusive && !self.running.is_empty() {
-            if self.running.values().all(|r| !r.exclusive) {
-                self.draining = Some(id);
-            }
-            return Ok(());
-        }
-        if !exclusive
-            && (self.running.len() >= self.config.max_shared
-                || self.running.values().any(|r| r.exclusive))
-        {
-            return Ok(());
-        }
-        let lock = open_lock(&self.config.lock)?;
-        if !try_lock(&lock, exclusive)? {
-            return Ok(());
-        }
-        if self.draining == Some(id) {
-            self.draining = None;
-        }
+        Ok(())
+    }
+
+    fn start_job(&mut self, plan: Planned<Vec<File>>) -> io::Result<()> {
+        let Planned {
+            id,
+            resources,
+            locks,
+            ..
+        } = plan;
         let job = self.state.jobs.iter_mut().find(|j| j.id == id).unwrap();
         job.status = Status::Starting;
         job.started = Some(now());
+        job.threads = resources.cpu.map(|_| resources.threads);
         self.save()?;
         let job = self.state.jobs.iter().find(|j| j.id == id).unwrap();
         let stdout = private_file(&self.config.dir.join(format!("{id}.stdout")))?;
         let stderr = private_file(&self.config.dir.join(format!("{id}.stderr")))?;
-        // A non-CLOEXEC duplicate lets the job retain the lock if the scheduler dies.
-        let fd = unsafe { libc::fcntl(lock.as_raw_fd(), libc::F_DUPFD, 3) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
+        // Non-CLOEXEC duplicates let jobs retain both locks if the scheduler dies.
+        let mut inherited = Vec::new();
+        for lock in &locks {
+            let fd = unsafe { libc::fcntl(lock.as_raw_fd(), libc::F_DUPFD, 3) };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            inherited.push(unsafe { File::from_raw_fd(fd) });
         }
-        let inherited = unsafe { File::from_raw_fd(fd) };
-        let result = Command::new(&job.command[0])
+        let mut command = Command::new(&job.command[0]);
+        command
             .args(&job.command[1..])
             .current_dir(&job.cwd)
             .env_clear()
@@ -302,8 +380,11 @@ impl Server {
             .stdin(Stdio::null())
             .stdout(stdout)
             .stderr(stderr)
-            .process_group(0)
-            .spawn();
+            .process_group(0);
+        if resources.cpu.is_some() {
+            command.env("SOGOTF_THREADS", resources.threads.to_string());
+        }
+        let result = command.spawn();
         drop(inherited);
         match result {
             Ok(child) => {
@@ -317,15 +398,15 @@ impl Server {
                     id,
                     Running {
                         child,
-                        _lock: lock,
-                        exclusive,
+                        _locks: locks,
+                        resources,
                         started: Instant::now(),
                         low_since: None,
                         stopping: None,
                         exit: None,
                     },
                 );
-                if exclusive {
+                if resources.gpu == Some(Access::Exclusive) {
                     self.next_sample = Instant::now() + Duration::from_secs(self.config.startup);
                 }
             }
@@ -401,8 +482,8 @@ impl Server {
                 }
             }
             // Descendants retain the lock if they outlive the scheduler.
-            drop(running._lock);
-            if running.exclusive {
+            drop(running._locks);
+            if running.resources.gpu == Some(Access::Exclusive) {
                 if let Some(mut sample) = self.sample.take() {
                     signal_group(sample.child.id(), libc::SIGKILL);
                     let _ = sample.child.wait();
@@ -420,7 +501,7 @@ impl Server {
         let Some(id) = self
             .running
             .iter()
-            .find(|(_, r)| r.exclusive)
+            .find(|(_, r)| r.resources.gpu == Some(Access::Exclusive))
             .map(|(id, _)| *id)
         else {
             return Ok(());
@@ -519,6 +600,17 @@ pub fn serve(config: Config) -> io::Result<()> {
     if !try_lock(&daemon_lock, true)? {
         return Err(io::Error::other("scheduler is already running"));
     }
+    let gpu_meta = open_lock(&config.lock)?.metadata()?;
+    let cpu_meta = open_lock(&config.cpu_lock)?.metadata()?;
+    let daemon_meta = daemon_lock.metadata()?;
+    if (gpu_meta.dev(), gpu_meta.ino()) == (cpu_meta.dev(), cpu_meta.ino())
+        || (gpu_meta.dev(), gpu_meta.ino()) == (daemon_meta.dev(), daemon_meta.ino())
+        || (cpu_meta.dev(), cpu_meta.ino()) == (daemon_meta.dev(), daemon_meta.ino())
+    {
+        return Err(io::Error::other(
+            "GPU, CPU and scheduler locks must be distinct files",
+        ));
+    }
     let state_path = config.dir.join("state.json");
     let mut state: State = if state_path.exists() {
         serde_json::from_reader(File::open(state_path)?)?
@@ -526,6 +618,22 @@ pub fn serve(config: Config) -> io::Result<()> {
         State::default()
     };
     for job in &mut state.jobs {
+        if !job.resources_explicit {
+            job.gpu = true;
+            if job.exclusive {
+                job.cpu = Some(Access::Exclusive);
+            }
+            job.resources_explicit = true;
+        }
+        if job.status == Status::Queued
+            && job
+                .requested_threads
+                .is_some_and(|n| n == 0 || n > config.cpu_threads || job.cpu.is_none())
+        {
+            job.status = Status::Failed;
+            job.finished = Some(now());
+            job.detail = Some("requested thread count is invalid for the configured CPU".into());
+        }
         if matches!(
             job.status,
             Status::Starting | Status::Running | Status::Stopping
@@ -549,6 +657,8 @@ pub fn serve(config: Config) -> io::Result<()> {
         state,
         running: BTreeMap::new(),
         draining: None,
+        batch_deadline: None,
+        clock: Instant::now(),
         sample: None,
         next_sample: Instant::now(),
     };
