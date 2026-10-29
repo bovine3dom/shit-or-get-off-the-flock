@@ -63,6 +63,9 @@ impl Harness {
     fn restart(&mut self) {
         self.child.kill().unwrap();
         self.child.wait().unwrap();
+        self.start();
+    }
+    fn start(&mut self) {
         self.child = Command::new(env!("CARGO_BIN_EXE_sogotf"))
             .arg("--state-dir")
             .arg(&self.dir)
@@ -355,8 +358,13 @@ fn recovery_waits_for_orphaned_shared_jobs_across_restarts() {
     let result = h.run(&["--", "/bin/true"]);
     assert!(String::from_utf8_lossy(&result.stdout).contains("unknown"));
     assert_eq!(h.job(2)["status"], "queued");
+    let draining = h.run(&["drain"]);
+    assert!(String::from_utf8_lossy(&draining.stdout).contains("draining"));
     h.restart();
     assert_eq!(h.job(2)["status"], "queued");
+    h.run(&["drain", "--wait"]);
+    assert_eq!(h.job(2)["status"], "queued");
+    h.run(&["resume"]);
     h.wait_status(2, &["succeeded"]);
 }
 
@@ -373,6 +381,85 @@ fn cpu_batch_submission_returns_estimates() {
     h.run(&["cancel", "2"]);
     h.wait_status(1, &["cancelled"]);
     h.wait_status(2, &["cancelled"]);
+}
+
+#[test]
+fn drain_preserves_queued_jobs_and_wait_clients_across_restart() {
+    let mut h = Harness::new(&["--cpu-threads", "1", "--batch-ms", "0"]);
+    h.run(&["--cpu", "shared", "--threads", "1", "--", "/bin/sleep", "3"]);
+    h.wait_status(1, &["running"]);
+    let waiter = Command::new(env!("CARGO_BIN_EXE_sogotf"))
+        .arg("--state-dir")
+        .arg(&h.dir)
+        .args([
+            "--wait",
+            "--cpu",
+            "shared",
+            "--threads",
+            "1",
+            "--",
+            "/bin/true",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let until = Instant::now() + Duration::from_secs(5);
+    while !h.invoke(&["status", "2"]).status.success() {
+        assert!(Instant::now() < until, "waiting client failed to submit");
+        sleep(Duration::from_millis(50));
+    }
+    assert_eq!(h.job(2)["status"], "queued");
+    h.run(&["drain"]);
+    h.run(&["drain", "--wait"]);
+    assert_eq!(h.job(1)["status"], "succeeded");
+    assert_eq!(h.job(2)["status"], "queued");
+    h.child.kill().unwrap();
+    h.child.wait().unwrap();
+    sleep(Duration::from_secs(1));
+    h.start();
+    sleep(Duration::from_millis(500));
+    assert_eq!(h.job(2)["status"], "queued");
+    let submitted = h.run(&["--cpu", "shared", "--threads", "1", "--", "/bin/true"]);
+    assert_eq!(estimated_wait(&submitted), None);
+    assert_eq!(h.job(3)["status"], "queued");
+    h.run(&["resume"]);
+    let result = waiter.wait_with_output().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    h.wait_status(2, &["succeeded"]);
+    h.wait_status(3, &["succeeded"]);
+}
+
+#[test]
+fn gpu_cap_does_not_limit_cpu_jobs() {
+    let h = Harness::new(&["--cpu-threads", "3", "--batch-ms", "0", "--max-shared", "1"]);
+    for id in 1..=4 {
+        h.run(&[
+            "--cpu",
+            "shared",
+            "--threads",
+            "1",
+            "--",
+            "/bin/sleep",
+            "15",
+        ]);
+        if id <= 3 {
+            assert_eq!(h.wait_status(id, &["running"])["threads"], 1);
+        }
+    }
+    assert_eq!(h.job(4)["status"], "queued");
+    h.run(&["--gpu", "shared", "--", "/bin/sleep", "15"]);
+    h.wait_status(5, &["running"]);
+    h.run(&["--gpu", "shared", "--", "/bin/sleep", "15"]);
+    assert_eq!(h.job(6)["status"], "queued");
+    for id in 1..=6 {
+        h.run(&["cancel", &id.to_string()]);
+        h.wait_status(id, &["cancelled"]);
+    }
 }
 
 #[test]

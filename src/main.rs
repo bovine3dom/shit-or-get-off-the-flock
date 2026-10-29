@@ -7,7 +7,7 @@ mod server;
 
 use model::{Access, Request, Response, Status};
 use std::env;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -16,7 +16,7 @@ use std::time::Duration;
 
 const HELP: &str = "sogotf [--state-dir DIR] serve --lock PATH [options]
 sogotf [--state-dir DIR] [--wait] [--exclusive | [--cpu MODE] [--gpu MODE]] [--threads N] [--approx-execution-time SECONDS] -- COMMAND [ARGS...]
-sogotf [--state-dir DIR] list | status ID | cancel ID
+sogotf [--state-dir DIR] list | status ID | cancel ID | drain [--wait] | resume
 
 --cpu and --gpu accept shared or exclusive. With no resource options, jobs
 share the GPU; --exclusive requests exclusive CPU and GPU.
@@ -27,7 +27,7 @@ Server options:
   --cpu-lock PATH             CPU flock file (default: STATE_DIR/cpu.lock)
   --cpu-threads THREADS       Available CPU threads (default: detected CPUs)
   --batch-ms MILLISECONDS     CPU shared-job batching window (default: 1000)
-  --max-shared JOBS           Maximum concurrent shared jobs (default: 10)
+  --max-shared JOBS           Maximum concurrent shared GPU jobs (default: 10)
   --max-runtime SECONDS       Hard runtime limit (default: 86400)
   --default-estimate SECONDS  Estimate without history (default: 3600)
   --startup SECONDS           Idle-check grace period (default: 60)
@@ -58,21 +58,48 @@ fn access(value: &str) -> Result<Access, String> {
     }
 }
 
-fn request(dir: &Path, request: &Request) -> Result<Response, String> {
-    let mut stream = UnixStream::connect(dir.join("scheduler.sock"))
-        .map_err(|e| format!("connect to scheduler: {e}"))?;
-    serde_json::to_writer(&mut stream, request).map_err(|e| e.to_string())?;
-    stream.write_all(b"\n").map_err(|e| e.to_string())?;
+fn request(dir: &Path, request: &Request) -> io::Result<Response> {
+    let mut stream = UnixStream::connect(dir.join("scheduler.sock"))?;
+    {
+        let mut writer = io::BufWriter::new(&mut stream);
+        serde_json::to_writer(&mut writer, request)?;
+        writer.write_all(b"\n")?;
+        writer.flush()?;
+    }
     let mut line = String::new();
-    BufReader::new(stream)
-        .read_line(&mut line)
-        .map_err(|e| e.to_string())?;
-    let response: Response =
-        serde_json::from_str(&line).map_err(|e| format!("invalid scheduler response: {e}"))?;
+    BufReader::new(stream).read_line(&mut line)?;
+    if !line.ends_with('\n') {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "scheduler closed connection",
+        ));
+    }
+    let response: Response = serde_json::from_str(&line)?;
     if let Some(error) = &response.error {
-        return Err(error.clone());
+        return Err(io::Error::other(error.clone()));
     }
     Ok(response)
+}
+
+fn retry_request(dir: &Path, req: &Request) -> io::Result<Response> {
+    loop {
+        match request(dir, req) {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound
+                        | io::ErrorKind::ConnectionRefused
+                        | io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::BrokenPipe
+                        | io::ErrorKind::UnexpectedEof
+                ) =>
+            {
+                thread::sleep(Duration::from_millis(250));
+            }
+            result => return result,
+        }
+    }
 }
 
 fn run() -> Result<i32, String> {
@@ -168,7 +195,7 @@ fn run() -> Result<i32, String> {
     }
     match rest[0].as_str() {
         "list" if rest.len() == 1 => {
-            let response = request(&dir, &Request::List)?;
+            let response = request(&dir, &Request::List).map_err(|e| e.to_string())?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&response.jobs).map_err(|e| e.to_string())?
@@ -182,11 +209,34 @@ fn run() -> Result<i32, String> {
             } else {
                 Request::Cancel { id }
             };
-            let response = request(&dir, &req)?;
+            let response = request(&dir, &req).map_err(|e| e.to_string())?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&response.jobs[0]).map_err(|e| e.to_string())?
             );
+            return Ok(0);
+        }
+        "drain" if rest.len() == 1 || (rest.len() == 2 && rest[1] == "--wait") => {
+            let mut response = request(&dir, &Request::Drain).map_err(|e| e.to_string())?;
+            if rest.len() == 2 {
+                while response.drained != Some(true) {
+                    thread::sleep(Duration::from_millis(250));
+                    response = retry_request(&dir, &Request::Drain).map_err(|e| e.to_string())?;
+                }
+            }
+            println!(
+                "{}",
+                if response.drained == Some(true) {
+                    "scheduler drained"
+                } else {
+                    "scheduler draining"
+                }
+            );
+            return Ok(0);
+        }
+        "resume" if rest.len() == 1 => {
+            request(&dir, &Request::Resume).map_err(|e| e.to_string())?;
+            println!("scheduler resumed");
             return Ok(0);
         }
         _ => {}
@@ -264,12 +314,13 @@ fn run() -> Result<i32, String> {
             requested_threads,
             resources_explicit: true,
         },
-    )?;
+    )
+    .map_err(|e| e.to_string())?;
     let id = response.jobs[0].id;
     match response.wait_seconds {
         Some(seconds) => println!("job {id}: estimated time until start: {seconds}s"),
         None => println!(
-            "job {id}: estimated time until start: unknown (resource availability or recovery)"
+            "job {id}: estimated time until start: unknown (resource availability, recovery or pause)"
         ),
     }
     println!(
@@ -279,7 +330,7 @@ fn run() -> Result<i32, String> {
     );
     if wait {
         loop {
-            let response = request(&dir, &Request::Get { id })?;
+            let response = retry_request(&dir, &Request::Get { id }).map_err(|e| e.to_string())?;
             let job = &response.jobs[0];
             if job.status.terminal() {
                 println!(

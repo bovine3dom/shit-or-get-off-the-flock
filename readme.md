@@ -26,7 +26,7 @@ the scheduler runs in the foreground. probably best to run it as a service. othe
 flock /tmp/gpu.lock your-existing-command
 ```
 
-jobs using the old interface share the GPU by default, with up to 10 running together. set another limit with `--max-shared`; the limit applies to each resource, and external shared lock holders use additional slots.
+jobs using the old interface share the GPU by default, with up to 10 running together. set another GPU job limit with `--max-shared`. the CPU thread budget limits concurrent CPU jobs. the GPU job limit counts jobs managed by this scheduler.
 
 each scheduler manages one GPU lock and one CPU lock. use one scheduler for each CPU thread budget: separate schedulers share exclusive locks, but each keeps its own thread count. external CPU jobs can use the CPU lock in the same way as the GPU lock.
 
@@ -63,7 +63,7 @@ systemctl --user status sogotf.service
 
 add the eviction options from below to `ExecStart` if you want them. use `loginctl enable-linger "$USER"` to keep the user service running after logout.
 
-systemd stops the service's running jobs when you stop or restart the service; the scheduler marks them as interrupted on its next start.
+systemd stops the service's running jobs during a direct stop or restart. use the drain procedure below to let the jobs finish first.
 
 ## jobs
 
@@ -141,13 +141,34 @@ device utilization includes other processes, and jobs can go quiet while loading
 | `--cpu-lock PATH` | state directory `cpu.lock` | CPU `flock` file |
 | `--cpu-threads THREADS` | detected CPU count | CPU thread budget |
 | `--batch-ms MILLISECONDS` | 1000 | shared CPU batching window |
-| `--max-shared JOBS` | 10 | maximum shared jobs per resource |
+| `--max-shared JOBS` | 10 | maximum concurrent shared GPU jobs |
 | `--max-runtime SECONDS` | 86400 | maximum job runtime |
 | `--default-estimate SECONDS` | 3600 | estimate before history exists |
 | `--startup SECONDS` | 60 | grace period before idle sampling |
 | `--idle-threshold PERCENT` | 0 | idle eviction threshold |
 | `--idle-seconds SECONDS` | 60 | time below threshold before eviction |
 | `--usage-command COMMAND` | unset | shell command that prints utilization |
+
+## safe restart
+
+pause the queue and wait for running jobs and recovery to finish:
+
+```sh
+sogotf drain --wait
+systemctl --user restart sogotf.service
+sogotf resume
+```
+
+`drain` also works without `--wait`. it pauses new starts and reports when the scheduler is drained. submitted jobs stay queued. the pause stays active across restarts. use `resume` to start queued jobs again. waiting clients reconnect while the scheduler restarts.
+
+for an upgrade, install the new binary with an atomic rename before the restart:
+
+```sh
+install -m755 target/release/sogotf "$HOME/.local/bin/sogotf.new"
+mv "$HOME/.local/bin/sogotf.new" "$HOME/.local/bin/sogotf"
+```
+
+the running scheduler must support `drain` for this procedure. for a foreground scheduler, stop and start it after the drain completes, then resume the queue.
 
 ## cleanup and crashes
 

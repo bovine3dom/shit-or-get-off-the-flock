@@ -74,7 +74,6 @@ fn fits(request: Resources, active: impl Iterator<Item = Resources>, limits: Lim
         let cpu: Vec<_> = active.iter().filter(|r| r.cpu.is_some()).collect();
         if (mode == Access::Exclusive && !cpu.is_empty())
             || cpu.iter().any(|r| r.cpu == Some(Access::Exclusive))
-            || cpu.len() >= limits.max_shared
             || request.threads
                 > limits
                     .cpu_threads
@@ -523,17 +522,41 @@ mod tests {
     }
 
     #[test]
-    fn existing_batch_deadline_and_shared_slot_limit_are_included() {
+    fn existing_batch_deadline_is_included() {
         let queue = vec![q(1, None, Some(S), 1)];
         assert_eq!(
             estimate_wait(queue, 1, vec![], limits(), None, Some(250), no_external()),
             Some(1)
         );
+    }
+
+    #[test]
+    fn shared_limit_applies_to_gpu_but_cpu_uses_thread_budget() {
         let mut cap = limits();
         cap.max_shared = 1;
-        let queue = vec![q(1, None, Some(S), 3), q(2, None, Some(S), 1)];
+        cap.cpu_threads = 2;
+        let cpu = vec![
+            fixed(q(1, None, Some(S), 3), 1),
+            fixed(q(2, None, Some(S), 1), 1),
+        ];
         assert_eq!(
-            estimate_wait(queue, 2, vec![], cap, None, None, no_external()),
+            estimate_wait(cpu.clone(), 2, vec![], cap, None, None, no_external()),
+            Some(1)
+        );
+        let planned = plan(&cpu, &[], &mut None, &mut Some(1000), 1000, cap, |_| {
+            Ok(Some(()))
+        })
+        .unwrap();
+        assert_eq!(planned.len(), 2);
+        let mut full = cpu.clone();
+        full.push(fixed(q(3, None, Some(S), 1), 1));
+        assert_eq!(
+            estimate_wait(full, 3, vec![], cap, None, None, no_external()),
+            Some(3)
+        );
+        let gpu = vec![q(1, Some(S), Some(S), 3), q(2, Some(S), Some(S), 1)];
+        assert_eq!(
+            estimate_wait(gpu, 2, vec![], cap, None, None, no_external()),
             Some(5)
         );
     }

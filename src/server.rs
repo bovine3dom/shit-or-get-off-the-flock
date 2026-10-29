@@ -2,7 +2,7 @@ use crate::model::{now, ordered, Access, Job, Request, Response, State, Status};
 use crate::scheduler::{estimate_wait, plan, Limits, Planned, Queued, Resources, Timed};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -133,7 +133,11 @@ impl Server {
     fn save(&self) -> io::Result<()> {
         let temp = self.config.dir.join("state.json.tmp");
         let mut file = private_file(&temp)?;
-        serde_json::to_writer(&mut file, &self.state)?;
+        {
+            let mut writer = BufWriter::new(&mut file);
+            serde_json::to_writer(&mut writer, &self.state)?;
+            writer.flush()?;
+        }
         file.sync_all()?;
         fs::rename(temp, self.config.dir.join("state.json"))?;
         File::open(&self.config.dir)?.sync_all()
@@ -251,7 +255,7 @@ impl Server {
                 let deadline = self
                     .batch_deadline
                     .map(|t| t.saturating_sub(millis(self.clock.elapsed())));
-                let wait = if self.state.recovery_pending {
+                let wait = if self.state.recovery_pending || self.state.paused {
                     None
                 } else {
                     estimate_wait(
@@ -270,6 +274,22 @@ impl Server {
                 Ok(response)
             }
             Request::List => Ok(Response::jobs(self.state.jobs.clone())),
+            Request::Drain => {
+                if !self.state.paused {
+                    self.state.paused = true;
+                    self.save()?;
+                }
+                let mut response = Response::jobs(vec![]);
+                response.drained = Some(self.running.is_empty() && !self.state.recovery_pending);
+                Ok(response)
+            }
+            Request::Resume => {
+                if self.state.paused {
+                    self.state.paused = false;
+                    self.save()?;
+                }
+                Ok(Response::jobs(vec![]))
+            }
             Request::Get { id } => Ok(match self.state.jobs.iter().find(|j| j.id == id) {
                 Some(job) => Response::jobs(vec![job.clone()]),
                 None => Response::error("job not found"),
@@ -326,6 +346,9 @@ impl Server {
             };
             self.state.recovery_pending = false;
             self.save()?;
+        }
+        if self.state.paused {
+            return Ok(());
         }
         let jobs: Vec<_> = ordered(&self.state).into_iter().map(Queued::job).collect();
         let active: Vec<_> = self.running.values().map(|r| r.resources).collect();
@@ -576,9 +599,11 @@ fn handle_connection(server: &mut Server, mut stream: UnixStream) -> io::Result<
         Ok(request) => server.request(request)?,
         Err(error) => Response::error(format!("invalid request: {error}")),
     };
-    let result = serde_json::to_writer(&mut stream, &response)
+    let mut writer = BufWriter::new(&mut stream);
+    let result = serde_json::to_writer(&mut writer, &response)
         .map_err(io::Error::other)
-        .and_then(|_| stream.write_all(b"\n"));
+        .and_then(|_| writer.write_all(b"\n"))
+        .and_then(|_| writer.flush());
     if let Err(error) = result {
         eprintln!("response write failed: {error}");
     }

@@ -65,6 +65,8 @@ pub struct State {
     pub durations: Vec<u64>,
     #[serde(default)]
     pub recovery_pending: bool,
+    #[serde(default)]
+    pub paused: bool,
 }
 
 fn legacy_exclusive() -> bool {
@@ -94,6 +96,8 @@ pub enum Request {
         resources_explicit: bool,
     },
     List,
+    Drain,
+    Resume,
     Get {
         id: u64,
     },
@@ -107,6 +111,8 @@ pub struct Response {
     pub error: Option<String>,
     pub jobs: Vec<Job>,
     pub wait_seconds: Option<u64>,
+    #[serde(default)]
+    pub drained: Option<bool>,
 }
 
 impl Response {
@@ -115,6 +121,7 @@ impl Response {
             error: Some(message.into()),
             jobs: vec![],
             wait_seconds: None,
+            drained: None,
         }
     }
     pub fn jobs(mut jobs: Vec<Job>) -> Self {
@@ -125,6 +132,7 @@ impl Response {
             error: None,
             jobs,
             wait_seconds: None,
+            drained: None,
         }
     }
 }
@@ -184,6 +192,7 @@ mod tests {
             next_id: 3,
             durations: vec![],
             recovery_pending: false,
+            paused: false,
             jobs: vec![job(1, 0, 100), job(2, 10, 5), job(3, 201, 1)],
         };
         assert_eq!(
